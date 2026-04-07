@@ -11,6 +11,8 @@ const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 const NTFY_TOPIC = 'Jarvis-Rick6868';
 
 let lastUpdateId = 0;
+let processedUpdates = new Set();
+let tasks = [];
 
 // ── Salud del servidor ──
 app.get('/', (req, res) => res.send('Jarvis bot activo ✅'));
@@ -18,17 +20,19 @@ app.get('/', (req, res) => res.send('Jarvis bot activo ✅'));
 // ── Enviar mensaje a Telegram ──
 async function sendToTelegram(text) {
   try {
-    await fetch(`${TG_API}/sendMessage`, {
+    const r = await fetch(`${TG_API}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'Markdown' })
     });
+    const d = await r.json();
+    if (!d.ok) console.error('Telegram error:', JSON.stringify(d));
   } catch (e) {
     console.error('Error enviando a Telegram:', e.message);
   }
 }
 
-// ── Enviar alarma por ntfy (suena aunque esté en silencio) ──
+// ── Enviar alarma por ntfy ──
 async function sendAlarmNtfy(text) {
   try {
     await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
@@ -41,14 +45,44 @@ async function sendAlarmNtfy(text) {
       },
       body: text
     });
+    console.log('ntfy enviado correctamente');
   } catch (e) {
     console.error('Error enviando a ntfy:', e.message);
   }
 }
 
+// ── Programar alarma ──
+function scheduleAlarm(taskText, alarmTime, repeat) {
+  const alarmDate = new Date(alarmTime);
+  const diff = alarmDate.getTime() - Date.now();
+
+  console.log(`[ALARM] Programando: "${taskText}" para ${alarmDate.toISOString()} (diff: ${diff}ms)`);
+
+  if (isNaN(diff) || diff <= 0) {
+    console.log(`[ALARM] Hora inválida o en el pasado, ignorando.`);
+    return;
+  }
+
+  console.log(`[ALARM] setTimeout de ${diff}ms iniciado`);
+
+  setTimeout(async () => {
+    console.log(`[ALARM] 🔔 DISPARANDO: ${taskText}`);
+    await sendToTelegram(`🔔 *¡Recordatorio!*\n\n${taskText}`);
+    await sendAlarmNtfy(taskText);
+
+    if (repeat) {
+      const next = new Date(alarmTime);
+      if (repeat === 'diario') next.setDate(next.getDate() + 1);
+      else if (repeat === 'semanal') next.setDate(next.getDate() + 7);
+      scheduleAlarm(taskText, next.toISOString(), repeat);
+    }
+  }, diff);
+}
+
 // ── Procesar mensaje con Claude ──
 async function processWithClaude(text) {
   const now = new Date().toLocaleString('es-ES', { timeZone: 'America/Bogota' });
+  const isoNow = new Date().toISOString();
 
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -61,82 +95,44 @@ async function processWithClaude(text) {
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1000,
-        system: `Eres Jarvis, un asistente personal de organización. La fecha y hora actual es: ${now}.
+        system: `Eres Jarvis, asistente personal. Hora actual Colombia: ${now}. ISO actual: ${isoNow}.
 
-Tu trabajo es interpretar lo que el usuario quiere recordar y devolver SIEMPRE un JSON exacto (sin markdown, sin texto extra):
-
+Devuelve SIEMPRE solo un JSON sin markdown:
 {
-  "reply": "respuesta amigable en español confirmando la tarea",
-  "tasks": [
-    {
-      "text": "descripción clara de la tarea",
-      "alarmTime": "ISO 8601 datetime o null",
-      "repeat": "diario|semanal|null"
-    }
-  ]
+  "reply": "respuesta en español confirmando con hora exacta",
+  "tasks": [{"text": "tarea", "alarmTime": "ISO8601 con offset -05:00", "repeat": "diario|semanal|null"}]
 }
 
-Reglas:
-- "mañana" → calcula la fecha real
-- Hora sin fecha → asume hoy
-- "todos los días" → repeat: "diario"
-- "cada semana" → repeat: "semanal"
-- Siempre responde en español
-- reply debe confirmar la hora exacta programada
-- Si el mensaje no es una tarea (saludo, pregunta general, etc.), devuelve tasks: [] y responde amigablemente`,
+IMPORTANTE:
+- "en X minutos" = suma X minutos al ISO actual
+- "en 1 minuto" = suma 60 segundos al ISO actual  
+- alarmTime NUNCA puede ser null si el usuario pide recordatorio
+- Zona horaria Colombia = UTC-5 = -05:00
+- Ejemplo alarmTime correcto: 2026-04-07T13:35:00-05:00`,
         messages: [{ role: 'user', content: text }]
       })
     });
 
     const data = await res.json();
-    console.log('Claude status:', res.status, JSON.stringify(data).slice(0, 200));
 
     if (!data.content || !Array.isArray(data.content)) {
-      console.error('Claude error response:', JSON.stringify(data));
-      return { reply: '⚠️ Error con la IA: ' + (data.error?.message || 'respuesta inesperada'), tasks: [] };
+      console.error('Claude error:', JSON.stringify(data));
+      return { reply: '⚠️ Error: ' + (data.error?.message || 'respuesta inesperada'), tasks: [] };
     }
 
     const raw = data.content.map(c => c.text || '').join('');
+    console.log('[CLAUDE] Raw:', raw.slice(0, 400));
+
     try {
       return JSON.parse(raw.replace(/```json|```/g, '').trim());
     } catch {
-      return { reply: raw || 'No pude procesar eso. ¿Puedes reformularlo?', tasks: [] };
+      return { reply: raw || 'No pude procesar eso.', tasks: [] };
     }
 
   } catch (e) {
-    console.error('Error llamando a Claude:', e.message);
-    return { reply: 'Error conectando con la IA. Intenta de nuevo.', tasks: [] };
+    console.error('Error Claude:', e.message);
+    return { reply: 'Error con la IA.', tasks: [] };
   }
-}
-
-// ── Almacén de tareas en memoria ──
-let tasks = [];
-
-// ── Programar alarmas ──
-function scheduleAlarm(task, index) {
-  if (!task.alarmTime) return;
-  const diff = new Date(task.alarmTime).getTime() - Date.now();
-  if (diff <= 0) return;
-
-  console.log(`Alarma programada: "${task.task_text}" en ${Math.round(diff/1000)}s`);
-
-  setTimeout(async () => {
-    console.log(`Disparando alarma: ${task.task_text}`);
-
-    // Enviar por Telegram
-    await sendToTelegram(`🔔 *¡Recordatorio!*\n\n${task.task_text}`);
-
-    // Enviar alarma por ntfy (suena aunque esté en silencio)
-    await sendAlarmNtfy(task.task_text);
-
-    if (task.repeat) {
-      const next = new Date(task.alarmTime);
-      if (task.repeat === 'diario') next.setDate(next.getDate() + 1);
-      else if (task.repeat === 'semanal') next.setDate(next.getDate() + 7);
-      tasks[index].alarmTime = next.toISOString();
-      scheduleAlarm(tasks[index], index);
-    }
-  }, diff);
 }
 
 // ── Polling de Telegram ──
@@ -147,28 +143,28 @@ async function pollTelegram() {
 
     if (data.ok && data.result.length > 0) {
       for (const update of data.result) {
+        if (processedUpdates.has(update.update_id)) continue;
+        processedUpdates.add(update.update_id);
         lastUpdateId = update.update_id;
+
         const msg = update.message;
         if (!msg || !msg.text) continue;
 
-        console.log(`Mensaje recibido: ${msg.text}`);
+        console.log(`[TG] Mensaje: ${msg.text}`);
 
         const parsed = await processWithClaude(msg.text);
         await sendToTelegram(parsed.reply);
 
         if (parsed.tasks && parsed.tasks.length > 0) {
-          parsed.tasks.forEach(t => {
-            const newTask = {
-              task_text: t.text,
-              alarmTime: t.alarmTime || null,
-              repeat: t.repeat || null
-            };
-            const idx = tasks.length;
-            tasks.push(newTask);
-            scheduleAlarm(newTask, idx);
-            console.log(`Tarea guardada: ${t.text}`);
-            console.log(`AlarmTime recibido: ${t.alarmTime}`);
-          });
+          for (const t of parsed.tasks) {
+            console.log(`[TASK] text="${t.text}" alarmTime="${t.alarmTime}" repeat="${t.repeat}"`);
+            tasks.push({ text: t.text, alarmTime: t.alarmTime, repeat: t.repeat });
+            if (t.alarmTime) {
+              scheduleAlarm(t.text, t.alarmTime, t.repeat);
+            } else {
+              console.log('[TASK] Sin alarmTime, no se programa alarma');
+            }
+          }
         }
       }
     }
@@ -179,32 +175,10 @@ async function pollTelegram() {
   setTimeout(pollTelegram, 3000);
 }
 
-// ── API para la app web ──
-app.get('/tasks', (req, res) => res.json(tasks));
-
-app.post('/tasks', async (req, res) => {
-  const { text } = req.body;
-  if (!text) return res.status(400).json({ error: 'Sin texto' });
-
-  const parsed = await processWithClaude(text);
-
-  if (parsed.tasks && parsed.tasks.length > 0) {
-    parsed.tasks.forEach(t => {
-      const newTask = { task_text: t.text, alarmTime: t.alarmTime || null, repeat: t.repeat || null };
-      const idx = tasks.length;
-      tasks.push(newTask);
-      scheduleAlarm(newTask, idx);
-    });
-    await sendToTelegram(`✅ *Tarea añadida desde la web*\n\n${parsed.tasks.map(t => `• ${t.text}`).join('\n')}`);
-  }
-
-  res.json(parsed);
-});
-
 // ── Arrancar ──
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Jarvis corriendo en puerto ${PORT}`);
+  console.log(`[SERVER] Jarvis corriendo en puerto ${PORT}`);
   sendToTelegram('🤖 *Jarvis está en línea*\n\nEscríbeme cualquier tarea o recordatorio.');
   pollTelegram();
 });
