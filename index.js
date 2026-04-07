@@ -16,28 +16,33 @@ app.get('/', (req, res) => res.send('Jarvis bot activo ✅'));
 
 // ── Enviar mensaje a Telegram ──
 async function sendToTelegram(text) {
-  await fetch(`${TG_API}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'Markdown' })
-  });
+  try {
+    await fetch(`${TG_API}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'Markdown' })
+    });
+  } catch (e) {
+    console.error('Error enviando a Telegram:', e.message);
+  }
 }
 
 // ── Procesar mensaje con Claude ──
 async function processWithClaude(text) {
   const now = new Date().toLocaleString('es-ES', { timeZone: 'Europe/Madrid' });
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': CLAUDE_API_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1000,
-      system: `Eres Jarvis, un asistente personal de organización. La fecha y hora actual es: ${now}.
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        system: `Eres Jarvis, un asistente personal de organización. La fecha y hora actual es: ${now}.
 
 Tu trabajo es interpretar lo que el usuario quiere recordar y devolver SIEMPRE un JSON exacto (sin markdown, sin texto extra):
 
@@ -59,17 +64,29 @@ Reglas:
 - "cada semana" → repeat: "semanal"
 - Siempre responde en español
 - reply debe confirmar la hora exacta programada
-- Si el mensaje no es una tarea (es un saludo, pregunta general, etc.), devuelve tasks: [] y responde amigablemente`,
-      messages: [{ role: 'user', content: text }]
-    })
-  });
+- Si el mensaje no es una tarea (saludo, pregunta general, etc.), devuelve tasks: [] y responde amigablemente`,
+        messages: [{ role: 'user', content: text }]
+      })
+    });
 
-  const data = await res.json();
-  const raw = data.content.map(c => c.text || '').join('');
-  try {
-    return JSON.parse(raw.replace(/```json|```/g, '').trim());
-  } catch {
-    return { reply: 'Entendido, aunque no pude procesar eso como tarea. ¿Puedes reformularlo?', tasks: [] };
+    const data = await res.json();
+    console.log('Claude status:', res.status, JSON.stringify(data).slice(0, 200));
+
+    if (!data.content || !Array.isArray(data.content)) {
+      console.error('Claude error response:', JSON.stringify(data));
+      return { reply: '⚠️ Error con la IA: ' + (data.error?.message || 'respuesta inesperada'), tasks: [] };
+    }
+
+    const raw = data.content.map(c => c.text || '').join('');
+    try {
+      return JSON.parse(raw.replace(/```json|```/g, '').trim());
+    } catch {
+      return { reply: raw || 'No pude procesar eso. ¿Puedes reformularlo?', tasks: [] };
+    }
+
+  } catch (e) {
+    console.error('Error llamando a Claude:', e.message);
+    return { reply: 'Error conectando con la IA. Intenta de nuevo.', tasks: [] };
   }
 }
 
@@ -83,7 +100,7 @@ function scheduleAlarm(task, index) {
   if (diff <= 0) return;
 
   setTimeout(async () => {
-    await sendToTelegram(`🔔 *¡Recordatorio!*\n\n${task.tasks_text}`);
+    await sendToTelegram(`🔔 *¡Recordatorio!*\n\n${task.task_text}`);
 
     if (task.repeat) {
       const next = new Date(task.alarmTime);
@@ -111,14 +128,12 @@ async function pollTelegram() {
 
         const parsed = await processWithClaude(msg.text);
 
-        // Responder al usuario
         await sendToTelegram(parsed.reply);
 
-        // Guardar tareas y programar alarmas
         if (parsed.tasks && parsed.tasks.length > 0) {
           parsed.tasks.forEach(t => {
             const newTask = {
-              tasks_text: t.text,
+              task_text: t.text,
               alarmTime: t.alarmTime || null,
               repeat: t.repeat || null
             };
@@ -148,7 +163,7 @@ app.post('/tasks', async (req, res) => {
 
   if (parsed.tasks && parsed.tasks.length > 0) {
     parsed.tasks.forEach(t => {
-      const newTask = { tasks_text: t.text, alarmTime: t.alarmTime || null, repeat: t.repeat || null };
+      const newTask = { task_text: t.text, alarmTime: t.alarmTime || null, repeat: t.repeat || null };
       const idx = tasks.length;
       tasks.push(newTask);
       scheduleAlarm(newTask, idx);
