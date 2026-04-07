@@ -29,7 +29,7 @@ async function sendToTelegram(text) {
 
 // ── Procesar mensaje con Claude ──
 async function processWithClaude(text) {
-  const now = new Date().toLocaleString('es-ES', { timeZone: 'Europe/Madrid' });
+  const now = new Date().toLocaleString('es-ES', { timeZone: 'America/Bogota' });
 
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
