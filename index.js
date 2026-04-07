@@ -167,6 +167,7 @@ async function pollTelegram() {
             tasks.push(newTask);
             scheduleAlarm(newTask, idx);
             console.log(`Tarea guardada: ${t.text}`);
+            console.log(`AlarmTime recibido: ${t.alarmTime}`);
           });
         }
       }
