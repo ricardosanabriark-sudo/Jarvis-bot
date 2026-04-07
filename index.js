@@ -8,6 +8,7 @@ const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
+const NTFY_TOPIC = 'Jarvis-Rick6868';
 
 let lastUpdateId = 0;
 
@@ -24,6 +25,24 @@ async function sendToTelegram(text) {
     });
   } catch (e) {
     console.error('Error enviando a Telegram:', e.message);
+  }
+}
+
+// ── Enviar alarma por ntfy (suena aunque esté en silencio) ──
+async function sendAlarmNtfy(text) {
+  try {
+    await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
+      method: 'POST',
+      headers: {
+        'Title': '⏰ Recordatorio de Jarvis',
+        'Priority': 'urgent',
+        'Tags': 'alarm_clock',
+        'Content-Type': 'text/plain'
+      },
+      body: text
+    });
+  } catch (e) {
+    console.error('Error enviando a ntfy:', e.message);
   }
 }
 
@@ -99,8 +118,16 @@ function scheduleAlarm(task, index) {
   const diff = new Date(task.alarmTime).getTime() - Date.now();
   if (diff <= 0) return;
 
+  console.log(`Alarma programada: "${task.task_text}" en ${Math.round(diff/1000)}s`);
+
   setTimeout(async () => {
+    console.log(`Disparando alarma: ${task.task_text}`);
+
+    // Enviar por Telegram
     await sendToTelegram(`🔔 *¡Recordatorio!*\n\n${task.task_text}`);
+
+    // Enviar alarma por ntfy (suena aunque esté en silencio)
+    await sendAlarmNtfy(task.task_text);
 
     if (task.repeat) {
       const next = new Date(task.alarmTime);
@@ -127,7 +154,6 @@ async function pollTelegram() {
         console.log(`Mensaje recibido: ${msg.text}`);
 
         const parsed = await processWithClaude(msg.text);
-
         await sendToTelegram(parsed.reply);
 
         if (parsed.tasks && parsed.tasks.length > 0) {
