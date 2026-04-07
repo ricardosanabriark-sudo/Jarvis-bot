@@ -1,5 +1,6 @@
 const express = require('express');
 const fetch = require('node-fetch');
+const FormData = require('form-data');
 
 const app = express();
 app.use(express.json());
@@ -7,6 +8,7 @@ app.use(express.json());
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 const NTFY_TOPIC = 'Jarvis-Rick6868';
 
@@ -51,6 +53,46 @@ async function sendAlarmNtfy(text) {
   }
 }
 
+// ── Transcribir audio con Whisper ──
+async function transcribeAudio(fileId) {
+  try {
+    // 1. Obtener URL del archivo en Telegram
+    const fileRes = await fetch(`${TG_API}/getFile?file_id=${fileId}`);
+    const fileData = await fileRes.json();
+    const filePath = fileData.result.file_path;
+    const fileUrl = `https://api.telegram.org/file/bot${TG_TOKEN}/${filePath}`;
+
+    console.log(`[AUDIO] Descargando: ${fileUrl}`);
+
+    // 2. Descargar el audio
+    const audioRes = await fetch(fileUrl);
+    const audioBuffer = await audioRes.buffer();
+
+    // 3. Enviar a Whisper
+    const form = new FormData();
+    form.append('file', audioBuffer, { filename: 'audio.ogg', contentType: 'audio/ogg' });
+    form.append('model', 'whisper-1');
+    form.append('language', 'es');
+
+    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        ...form.getHeaders()
+      },
+      body: form
+    });
+
+    const whisperData = await whisperRes.json();
+    console.log(`[AUDIO] Transcripción: ${whisperData.text}`);
+    return whisperData.text || null;
+
+  } catch (e) {
+    console.error('[AUDIO] Error transcribiendo:', e.message);
+    return null;
+  }
+}
+
 // ── Programar alarma ──
 function scheduleAlarm(taskText, alarmTime, repeat) {
   const alarmDate = new Date(alarmTime);
@@ -62,8 +104,6 @@ function scheduleAlarm(taskText, alarmTime, repeat) {
     console.log(`[ALARM] Hora inválida o en el pasado, ignorando.`);
     return;
   }
-
-  console.log(`[ALARM] setTimeout de ${diff}ms iniciado`);
 
   setTimeout(async () => {
     console.log(`[ALARM] 🔔 DISPARANDO: ${taskText}`);
@@ -105,7 +145,7 @@ Devuelve SIEMPRE solo un JSON sin markdown:
 
 IMPORTANTE:
 - "en X minutos" = suma X minutos al ISO actual
-- "en 1 minuto" = suma 60 segundos al ISO actual  
+- "en 1 minuto" = suma 60 segundos al ISO actual
 - alarmTime NUNCA puede ser null si el usuario pide recordatorio
 - Zona horaria Colombia = UTC-5 = -05:00
 - Ejemplo alarmTime correcto: 2026-04-07T13:35:00-05:00`,
@@ -148,11 +188,44 @@ async function pollTelegram() {
         lastUpdateId = update.update_id;
 
         const msg = update.message;
-        if (!msg || !msg.text) continue;
+        if (!msg) continue;
 
-        console.log(`[TG] Mensaje: ${msg.text}`);
+        let text = null;
 
-        const parsed = await processWithClaude(msg.text);
+        // Mensaje de texto normal
+        if (msg.text) {
+          text = msg.text;
+          console.log(`[TG] Texto: ${text}`);
+        }
+        // Mensaje de voz
+        else if (msg.voice) {
+          console.log(`[TG] Audio recibido, transcribiendo...`);
+          await sendToTelegram('🎤 Escuchando tu mensaje de voz...');
+          text = await transcribeAudio(msg.voice.file_id);
+          if (text) {
+            console.log(`[TG] Audio transcrito: ${text}`);
+            await sendToTelegram(`📝 Entendí: _"${text}"_`);
+          } else {
+            await sendToTelegram('No pude entender el audio. ¿Puedes escribirlo?');
+            continue;
+          }
+        }
+        // Nota de voz larga
+        else if (msg.audio) {
+          console.log(`[TG] Audio largo recibido, transcribiendo...`);
+          await sendToTelegram('🎤 Escuchando tu mensaje de voz...');
+          text = await transcribeAudio(msg.audio.file_id);
+          if (text) {
+            await sendToTelegram(`📝 Entendí: _"${text}"_`);
+          } else {
+            await sendToTelegram('No pude entender el audio. ¿Puedes escribirlo?');
+            continue;
+          }
+        } else {
+          continue;
+        }
+
+        const parsed = await processWithClaude(text);
         await sendToTelegram(parsed.reply);
 
         if (parsed.tasks && parsed.tasks.length > 0) {
@@ -161,8 +234,6 @@ async function pollTelegram() {
             tasks.push({ text: t.text, alarmTime: t.alarmTime, repeat: t.repeat });
             if (t.alarmTime) {
               scheduleAlarm(t.text, t.alarmTime, t.repeat);
-            } else {
-              console.log('[TASK] Sin alarmTime, no se programa alarma');
             }
           }
         }
@@ -179,6 +250,6 @@ async function pollTelegram() {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`[SERVER] Jarvis corriendo en puerto ${PORT}`);
-  sendToTelegram('🤖 *Jarvis está en línea*\n\nEscríbeme cualquier tarea o recordatorio.');
+  sendToTelegram('🤖 *Jarvis está en línea*\n\nEscríbeme o mándame un audio con tu tarea.');
   pollTelegram();
 });
