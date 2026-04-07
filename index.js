@@ -38,7 +38,7 @@ async function sendAlarmNtfy(text) {
     await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
       method: 'POST',
       headers: {
-        'Title': '⏰ Recordatorio de Jarvis',
+        'Title': 'Recordatorio de Jarvis',
         'Priority': 'urgent',
         'Tags': 'alarm_clock',
         'Content-Type': 'text/plain'
