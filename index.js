@@ -1,6 +1,8 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const FormData = require('form-data');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
@@ -11,10 +13,26 @@ const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const TG_API = `https://api.telegram.org/bot${TG_TOKEN}`;
 const NTFY_TOPIC = 'Jarvis-Rick6868';
+const PDF_PATH = path.join(__dirname, 'Agenda Pomodoro BW Handwritten1.pdf');
 
 let lastUpdateId = 0;
 let processedUpdates = new Set();
 let tasks = [];
+let pdfBase64 = null;
+
+// ── Cargar PDF al iniciar ──
+function loadPDF() {
+  try {
+    if (fs.existsSync(PDF_PATH)) {
+      pdfBase64 = fs.readFileSync(PDF_PATH).toString('base64');
+      console.log('[PDF] Documento cargado correctamente');
+    } else {
+      console.warn('[PDF] Archivo no encontrado:', PDF_PATH);
+    }
+  } catch (e) {
+    console.error('[PDF] Error cargando:', e.message);
+  }
+}
 
 // ── Salud del servidor ──
 app.get('/', (req, res) => res.send('Jarvis bot activo ✅'));
@@ -56,7 +74,6 @@ async function sendAlarmNtfy(text) {
 // ── Transcribir audio con Whisper ──
 async function transcribeAudio(fileId) {
   try {
-    // 1. Obtener URL del archivo en Telegram
     const fileRes = await fetch(`${TG_API}/getFile?file_id=${fileId}`);
     const fileData = await fileRes.json();
     const filePath = fileData.result.file_path;
@@ -64,11 +81,9 @@ async function transcribeAudio(fileId) {
 
     console.log(`[AUDIO] Descargando: ${fileUrl}`);
 
-    // 2. Descargar el audio
     const audioRes = await fetch(fileUrl);
     const audioBuffer = await audioRes.buffer();
 
-    // 3. Enviar a Whisper
     const form = new FormData();
     form.append('file', audioBuffer, { filename: 'audio.ogg', contentType: 'audio/ogg' });
     form.append('model', 'whisper-1');
@@ -119,12 +134,38 @@ function scheduleAlarm(taskText, alarmTime, repeat) {
   }, diff);
 }
 
+// ── Detectar si es pregunta sobre el PDF ──
+function isPDFQuestion(text) {
+  const keywords = ['pomodoro', 'agenda', 'documento', 'pdf', 'técnica', 'tiempo', 'sesión', 'descanso', 'bloque', 'planificación', 'horario', 'método'];
+  const lower = text.toLowerCase();
+  return keywords.some(k => lower.includes(k));
+}
+
 // ── Procesar mensaje con Claude ──
 async function processWithClaude(text) {
   const now = new Date().toLocaleString('es-ES', { timeZone: 'America/Bogota' });
   const isoNow = new Date().toISOString();
+  const usePDF = pdfBase64 && isPDFQuestion(text);
 
   try {
+    let messages;
+
+    if (usePDF) {
+      console.log('[CLAUDE] Usando PDF para responder');
+      messages = [{
+        role: 'user',
+        content: [
+          {
+            type: 'document',
+            source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 }
+          },
+          { type: 'text', text }
+        ]
+      }];
+    } else {
+      messages = [{ role: 'user', content: text }];
+    }
+
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -137,19 +178,29 @@ async function processWithClaude(text) {
         max_tokens: 1000,
         system: `Eres Jarvis, asistente personal. Hora actual Colombia: ${now}. ISO actual: ${isoNow}.
 
-Devuelve SIEMPRE solo un JSON sin markdown:
+Tienes dos modos:
+
+MODO TAREA: Si el usuario quiere recordar algo o programar una alarma, devuelve JSON exacto:
 {
+  "type": "task",
   "reply": "respuesta en español confirmando con hora exacta",
-  "tasks": [{"text": "tarea", "alarmTime": "ISO8601 con offset -05:00", "repeat": "diario|semanal|null"}]
+  "tasks": [{"text": "tarea", "alarmTime": "ISO8601 con -05:00", "repeat": "diario|semanal|null"}]
 }
 
-IMPORTANTE:
+MODO PREGUNTA: Si el usuario pregunta algo general o sobre el documento, devuelve JSON exacto:
+{
+  "type": "answer",
+  "reply": "respuesta completa y útil en español"
+}
+
+REGLAS:
 - "en X minutos" = suma X minutos al ISO actual
-- "en 1 minuto" = suma 60 segundos al ISO actual
-- alarmTime NUNCA puede ser null si el usuario pide recordatorio
-- Zona horaria Colombia = UTC-5 = -05:00
-- Ejemplo alarmTime correcto: 2026-04-07T13:35:00-05:00`,
-        messages: [{ role: 'user', content: text }]
+- alarmTime NUNCA null si pide recordatorio
+- Zona Colombia = UTC-5 = -05:00
+- Si hay PDF adjunto, úsalo para responder preguntas sobre Pomodoro
+- Siempre responde en español
+- NUNCA uses markdown en el reply, solo texto plano`,
+        messages
       })
     });
 
@@ -157,7 +208,7 @@ IMPORTANTE:
 
     if (!data.content || !Array.isArray(data.content)) {
       console.error('Claude error:', JSON.stringify(data));
-      return { reply: '⚠️ Error: ' + (data.error?.message || 'respuesta inesperada'), tasks: [] };
+      return { type: 'answer', reply: '⚠️ Error: ' + (data.error?.message || 'respuesta inesperada'), tasks: [] };
     }
 
     const raw = data.content.map(c => c.text || '').join('');
@@ -166,12 +217,12 @@ IMPORTANTE:
     try {
       return JSON.parse(raw.replace(/```json|```/g, '').trim());
     } catch {
-      return { reply: raw || 'No pude procesar eso.', tasks: [] };
+      return { type: 'answer', reply: raw || 'No pude procesar eso.' };
     }
 
   } catch (e) {
     console.error('Error Claude:', e.message);
-    return { reply: 'Error con la IA.', tasks: [] };
+    return { type: 'answer', reply: 'Error con la IA.' };
   }
 }
 
@@ -192,28 +243,21 @@ async function pollTelegram() {
 
         let text = null;
 
-        // Mensaje de texto normal
         if (msg.text) {
           text = msg.text;
           console.log(`[TG] Texto: ${text}`);
-        }
-        // Mensaje de voz
-        else if (msg.voice) {
+        } else if (msg.voice) {
           console.log(`[TG] Audio recibido, transcribiendo...`);
           await sendToTelegram('🎤 Escuchando tu mensaje de voz...');
           text = await transcribeAudio(msg.voice.file_id);
           if (text) {
-            console.log(`[TG] Audio transcrito: ${text}`);
             await sendToTelegram(`📝 Entendí: _"${text}"_`);
           } else {
             await sendToTelegram('No pude entender el audio. ¿Puedes escribirlo?');
             continue;
           }
-        }
-        // Nota de voz larga
-        else if (msg.audio) {
-          console.log(`[TG] Audio largo recibido, transcribiendo...`);
-          await sendToTelegram('🎤 Escuchando tu mensaje de voz...');
+        } else if (msg.audio) {
+          await sendToTelegram('🎤 Escuchando...');
           text = await transcribeAudio(msg.audio.file_id);
           if (text) {
             await sendToTelegram(`📝 Entendí: _"${text}"_`);
@@ -228,13 +272,11 @@ async function pollTelegram() {
         const parsed = await processWithClaude(text);
         await sendToTelegram(parsed.reply);
 
-        if (parsed.tasks && parsed.tasks.length > 0) {
+        if (parsed.type === 'task' && parsed.tasks && parsed.tasks.length > 0) {
           for (const t of parsed.tasks) {
-            console.log(`[TASK] text="${t.text}" alarmTime="${t.alarmTime}" repeat="${t.repeat}"`);
+            console.log(`[TASK] text="${t.text}" alarmTime="${t.alarmTime}"`);
             tasks.push({ text: t.text, alarmTime: t.alarmTime, repeat: t.repeat });
-            if (t.alarmTime) {
-              scheduleAlarm(t.text, t.alarmTime, t.repeat);
-            }
+            if (t.alarmTime) scheduleAlarm(t.text, t.alarmTime, t.repeat);
           }
         }
       }
@@ -250,6 +292,7 @@ async function pollTelegram() {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`[SERVER] Jarvis corriendo en puerto ${PORT}`);
-  sendToTelegram('🤖 *Jarvis está en línea*\n\nEscríbeme o mándame un audio con tu tarea.');
+  loadPDF();
+  sendToTelegram('🤖 *Jarvis está en línea*\n\nPuedo recordarte tareas, escuchar audios y responder preguntas sobre tu agenda Pomodoro.');
   pollTelegram();
 });
